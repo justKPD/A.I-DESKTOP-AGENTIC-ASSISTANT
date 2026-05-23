@@ -185,6 +185,7 @@ class _BrowserThread:
     async def _launch(self):
         prog_id                        = _get_default_browser_id()
         engine_name, exe_path, channel = _find_browser_executable(prog_id)
+        print(f"[Browser] detected engine={engine_name} exe={exe_path} channel={channel}")
         engine                         = getattr(self._playwright, engine_name)
 
         launch_kwargs = {"headless": False}

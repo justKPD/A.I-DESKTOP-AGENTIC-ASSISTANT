@@ -1,9 +1,11 @@
-import asyncio
+﻿import asyncio
 import threading
 import json
 import re
 import sys
 import traceback
+import base64
+import binascii
 from pathlib import Path
 
 import pyaudio
@@ -25,7 +27,215 @@ from actions.screen_processor import screen_process
 from actions.youtube_video    import youtube_video
 from actions.cmd_control      import cmd_control
 from actions.desktop          import desktop_control
-from actions.browser_control  import browser_control
+from actions.browser_control  import browser_control as _browser_control_original
+from actions.browser_control  import _bt as _global_bt, _ensure_started as _global_ensure_started
+import types as _types_global
+
+async def _edge_launch_global(self_bt):
+    """Always use Microsoft Edge. Falls back to Chromium if Edge not found."""
+    if self_bt._browser and self_bt._browser.is_connected():
+        # Already running — reuse existing browser
+        if self_bt._page is None or self_bt._page.is_closed():
+            self_bt._page = await self_bt._context.new_page()
+        return
+    print("[Browser] 🔵 Launching Microsoft Edge...")
+    try:
+        self_bt._browser = await self_bt._playwright.chromium.launch(
+            headless=False,
+            channel="msedge",
+            args=["--start-maximized", "--no-first-run", "--no-default-browser-check"],
+        )
+        print("[Browser] ✅ Edge launched.")
+    except Exception as e:
+        print(f"[Browser] ⚠️ Edge failed ({e}), trying Chrome...")
+        try:
+            self_bt._browser = await self_bt._playwright.chromium.launch(
+                headless=False,
+                channel="chrome",
+                args=["--start-maximized"],
+            )
+            print("[Browser] ✅ Chrome launched.")
+        except Exception as e2:
+            print(f"[Browser] ⚠️ Chrome failed ({e2}), using built-in Chromium...")
+            self_bt._browser = await self_bt._playwright.chromium.launch(
+                headless=False,
+                args=["--start-maximized"],
+            )
+    self_bt._context = await self_bt._browser.new_context(
+        viewport=None,
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
+        ),
+    )
+    self_bt._page = await self_bt._context.new_page()
+
+# Patch the global browser thread to always use Edge
+_global_bt._launch = _types_global.MethodType(_edge_launch_global, _global_bt)
+
+def browser_control(parameters: dict, player=None, **kwargs):
+    """
+    Wrapper around the original browser_control that adds extra actions:
+    play_first_video, click_first_result, go_back, go_forward, refresh, accept_cookies.
+    All original actions pass through unchanged.
+    """
+    from actions.browser_control import _bt, _ensure_started
+    import asyncio, concurrent.futures
+
+    _ensure_started()
+    action = (parameters or {}).get("action", "").lower().strip()
+
+    # ── New actions ──────────────────────────────────────────────────────────
+    async def _play_first_video():
+        page = await _bt._get_page()
+        current_url = page.url
+
+        # Wait for page to settle
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+        # YouTube
+        if "youtube.com" in current_url:
+            # Wait up to 12s for YouTube results to render
+            try:
+                await page.wait_for_selector("ytd-video-renderer", timeout=12000)
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+            yt_selectors = [
+                "ytd-video-renderer a#video-title",
+                "ytd-video-renderer h3 a",
+                "#video-title",
+                "a#video-title",
+                "ytd-rich-item-renderer a#video-title-link",
+                "ytd-compact-video-renderer a",
+                ".ytd-video-renderer a[href*='watch']",
+            ]
+            for sel in yt_selectors:
+                try:
+                    await page.wait_for_selector(sel, timeout=2000)
+                    await page.click(sel)
+                    return f"Clicked first YouTube video ({sel})."
+                except Exception:
+                    continue
+            # Last resort: find any /watch link
+            try:
+                el = await page.query_selector('a[href*="/watch?v="]')
+                if el:
+                    await el.click()
+                    return "Clicked YouTube watch link."
+            except Exception:
+                pass
+            return "YouTube: could not find video to click."
+
+        # Dailymotion
+        if "dailymotion.com" in current_url:
+            dm_selectors = [
+                "article.VideoCard a",
+                "a.VideoCard_videoCard__oHyBn",
+                ".VideoCard a",
+                'a[href*="/video/"]',
+                "a.video_card",
+            ]
+            for sel in dm_selectors:
+                try:
+                    await page.wait_for_selector(sel, timeout=2000)
+                    await page.click(sel)
+                    return "Clicked first Dailymotion video."
+                except Exception:
+                    continue
+            return "Dailymotion: could not find video link."
+
+        # Generic — any site
+        generic_selectors = [
+            'a[href*="/watch?v="]',
+            'a[href*="watch"]',
+            'a[href*="/video/"]',
+            ".video-title a",
+            ".title a",
+            "h3 a",
+            "a.title",
+        ]
+        for sel in generic_selectors:
+            try:
+                await page.wait_for_selector(sel, timeout=3000)
+                await page.click(sel)
+                return "Clicked first video link."
+            except Exception:
+                continue
+        return "Could not find any video link on page."
+
+    async def _click_first_result():
+        page = await _bt._get_page()
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+        for sel in ["h3 a", ".result a", ".rc a", "a[data-ved]",
+                    ".search a", "li a", ".item a", "a[href]"]:
+            try:
+                await page.wait_for_selector(sel, timeout=3000)
+                await page.click(sel)
+                return "Clicked first search result."
+            except Exception:
+                continue
+        return "Could not find first result."
+
+    async def _go_back():
+        page = await _bt._get_page()
+        await page.go_back()
+        return "Went back."
+
+    async def _go_forward():
+        page = await _bt._get_page()
+        await page.go_forward()
+        return "Went forward."
+
+    async def _refresh():
+        page = await _bt._get_page()
+        await page.reload()
+        return "Page refreshed."
+
+    async def _accept_cookies():
+        page = await _bt._get_page()
+        for text in ["Accept", "Accept all", "Accept All", "I agree",
+                     "Allow all", "OK", "Agree", "Got it"]:
+            try:
+                btn = page.get_by_role("button", name=text, exact=False)
+                await btn.first.click(timeout=3000)
+                return f"Accepted cookies: '{text}'."
+            except Exception:
+                continue
+        return "No cookie banner found."
+
+    extra_actions = {
+        "play_first_video":   _play_first_video,
+        "click_first_result": _click_first_result,
+        "go_back":            _go_back,
+        "go_forward":         _go_forward,
+        "refresh":            _refresh,
+        "accept_cookies":     _accept_cookies,
+    }
+
+    if action in extra_actions:
+        try:
+            # Use _bt.run() — same mechanism as all other browser actions
+            result = _bt.run(extra_actions[action](), timeout=45)
+        except concurrent.futures.TimeoutError:
+            result = f"Action '{action}' timed out."
+        except Exception as e:
+            result = f"Action '{action}' error: {e}"
+        if player:
+            player.write_log(f"[browser] {result[:60]}")
+        print(f"[Browser] {result[:80]}")
+        return result
+
+    # ── Pass-through to original ──────────────────────────────────────────────
+    return _browser_control_original(parameters=parameters, player=player, **kwargs)
 from actions.file_controller  import file_controller
 from actions.code_helper      import code_helper
 from actions.dev_agent        import dev_agent
@@ -52,9 +262,6 @@ pya = pyaudio.PyAudio()
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
-    
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
 
 def _load_system_prompt() -> str:
     try:
@@ -73,13 +280,6 @@ _last_memory_input    = ""
 
 
 def _update_memory_async(user_text: str, jarvis_text: str) -> None:
-    """
-    Multilingual memory updater.
-    Model  : gemini-2.5-flash-lite (lowest cost)
-    Stage 1: Quick YES/NO check  → ~5 tokens output
-    Stage 2: Full extraction     → only if Stage 1 says YES
-    Result : ~80% fewer API calls vs original
-    """
     global _memory_turn_counter, _last_memory_input
 
     with _memory_turn_lock:
@@ -137,39 +337,50 @@ def _update_memory_async(user_text: str, jarvis_text: str) -> None:
             print(f"[Memory] ⚠️ {e}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL DECLARATIONS  — descriptions are carefully separated to avoid ambiguity
+# ─────────────────────────────────────────────────────────────────────────────
 TOOL_DECLARATIONS = [
     {
         "name": "open_app",
         "description": (
-            "Opens any application on the Windows computer. "
-            "Use this whenever the user asks to open, launch, or start any app, "
-            "website, or program. Always call this tool — never just say you opened it."
+            "Opens a LOCAL application installed on the computer. "
+            "Use ONLY for desktop apps like: Notepad, Calculator, Spotify, "
+            "VS Code, File Explorer, Settings, Discord, Steam, Paint, etc. "
+            "NEVER use for websites, YouTube, Google, or anything browser-related. "
+            "For any web task use browser_control instead."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "app_name": {
                     "type": "STRING",
-                    "description": "Exact name of the application (e.g. 'WhatsApp', 'Chrome', 'Spotify')"
+                    "description": "Exact name of the LOCAL application (e.g. 'Notepad', 'Spotify')"
                 }
             },
             "required": ["app_name"]
         }
     },
-{
-    "name": "web_search",
-    "description": "Searches the web for any information.",
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "query":  {"type": "STRING", "description": "Search query"},
-            "mode":   {"type": "STRING", "description": "search (default) or compare"},
-            "items":  {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Items to compare"},
-            "aspect": {"type": "STRING", "description": "price | specs | reviews"}
-        },
-        "required": ["query"]
-    }
-},
+    {
+        "name": "web_search",
+        "description": (
+            "Fetches factual information from the web and RETURNS it as text to read aloud. "
+            "Use ONLY when the user wants a spoken/text answer, like: "
+            "'what is the population of France', 'who invented the telephone', 'latest news about X'. "
+            "NEVER use if the user wants to SEE a browser open or navigate a website — "
+            "use browser_control for that."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query":  {"type": "STRING", "description": "Search query"},
+                "mode":   {"type": "STRING", "description": "search (default) or compare"},
+                "items":  {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Items to compare"},
+                "aspect": {"type": "STRING", "description": "price | specs | reviews"}
+            },
+            "required": ["query"]
+        }
+    },
     {
         "name": "weather_report",
         "description": "Gets real-time weather information for a city.",
@@ -208,25 +419,27 @@ TOOL_DECLARATIONS = [
         }
     },
     {
-    "name": "youtube_video",
-    "description": (
-        "Controls YouTube. Use for: playing videos, summarizing a video's content, "
-        "getting video info, or showing trending videos."
-    ),
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "action": {
-                "type": "STRING",
-                "description": "play | summarize | get_info | trending (default: play)"
+        "name": "youtube_video",
+        "description": (
+            "Use ONLY for: summarizing a YouTube video's content, getting metadata/info "
+            "about a specific video URL, or fetching the trending videos list as spoken text. "
+            "NEVER use to play or open YouTube in the browser — "
+            "use browser_control with action='go_to' and url='https://www.youtube.com/results?search_query=...' for that."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "summarize | get_info | trending  — do NOT use 'play', use browser_control for playing"
+                },
+                "query":  {"type": "STRING", "description": "Search query"},
+                "save":   {"type": "BOOLEAN", "description": "Save summary to Notepad (summarize only)"},
+                "region": {"type": "STRING", "description": "Country code for trending e.g. TR, US"},
+                "url":    {"type": "STRING", "description": "Video URL for get_info action"},
             },
-            "query":  {"type": "STRING", "description": "Search query for play action"},
-            "save":   {"type": "BOOLEAN", "description": "Save summary to Notepad (summarize only)"},
-            "region": {"type": "STRING", "description": "Country code for trending e.g. TR, US"},
-            "url":    {"type": "STRING", "description": "Video URL for get_info action"},
-        },
-        "required": []
-    }
+            "required": []
+        }
     },
     {
         "name": "screen_process",
@@ -253,37 +466,46 @@ TOOL_DECLARATIONS = [
         }
     },
     {
-    "name": "computer_settings",
-    "description": (
-        "Controls the computer: volume, brightness, window management, keyboard shortcuts, "
-        "typing text on screen, closing apps, fullscreen, dark mode, WiFi, restart, shutdown, "
-        "scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. "
-        "ALSO use for repeated actions: 'refresh 10 times', 'reload page 5 times' → action: reload_n, value: 10. "
-        "Use for ANY single computer control command — even if repeated N times. "
-        "NEVER route simple computer commands to agent_task."
-    ),
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "action":      {"type": "STRING", "description": "The action to perform (if known). For repeated reload: 'reload_n'"},
-            "description": {"type": "STRING", "description": "Natural language description of what to do"},
-            "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, number of times, etc."}
-        },
-        "required": []
-    }
-},
-    {
-        "name": "browser_control",
+        "name": "computer_settings",
         "description": (
-            "Controls the web browser. Use for: opening websites, searching the web, "
-            "clicking elements, filling forms, scrolling, finding cheapest products, "
-            "booking flights, any web-based task."
+            "Controls the computer: volume, brightness, window management, keyboard shortcuts, "
+            "typing text on screen, closing apps, fullscreen, dark mode, WiFi, restart, shutdown, "
+            "scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. "
+            "ALSO use for repeated actions: 'refresh 10 times', 'reload page 5 times' → action: reload_n, value: 10. "
+            "Use for ANY single computer control command — even if repeated N times. "
+            "NEVER route simple computer commands to agent_task."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | press | close"},
-                "url":         {"type": "STRING", "description": "URL for go_to action"},
+                "action":      {"type": "STRING", "description": "The action to perform (if known). For repeated reload: 'reload_n'"},
+                "description": {"type": "STRING", "description": "Natural language description of what to do"},
+                "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, number of times, etc."}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "browser_control",
+        "description": (
+            "THE ONLY tool for anything that requires opening Chrome or a web browser. "
+            "Use for ALL of these: opening any website, searching Google/Bing/DuckDuckGo, "
+            "playing YouTube/Dailymotion/any video, clicking links, filling web forms, "
+            "scrolling pages, shopping, checking prices, booking anything online. "
+            "ALWAYS chain multiple browser_control calls to complete a task: "
+            "Step 1 — navigate with go_to. Step 2 — play_first_video to click the first result. "
+            "For YouTube: go_to 'https://www.youtube.com/results?search_query=QUERY' then play_first_video. "
+            "For Dailymotion: go_to 'https://www.dailymotion.com/search/QUERY' then play_first_video. "
+            "For Google search: go_to 'https://www.google.com/search?q=QUERY'. "
+            "For clicking buttons/links on current page: use click_first_result or smart_click. "
+            "NEVER stop after just navigating — always follow up with play_first_video for video tasks. "
+            "If it involves a browser, a URL, or a website — ALWAYS use this tool."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":      {"type": "STRING", "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | press | close | play_first_video | click_first_result | accept_cookies | go_back | go_forward | refresh"},
+                "url":         {"type": "STRING", "description": "Full URL for go_to action (e.g. 'https://youtube.com/results?search_query=lofi+music')"},
                 "query":       {"type": "STRING", "description": "Search query for search action"},
                 "selector":    {"type": "STRING", "description": "CSS selector for click/type"},
                 "text":        {"type": "STRING", "description": "Text to click or type"},
@@ -354,124 +576,124 @@ TOOL_DECLARATIONS = [
         }
     },
     {
-    "name": "code_helper",
-    "description": (
-        "Writes, edits, explains, runs, or self-builds code files. "
-        "Use for ANY coding request: writing a script, fixing a file, "
-        "editing existing code, running a file, or building and testing automatically."
-    ),
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "action":      {"type": "STRING", "description": "write | edit | explain | run | build | auto (default: auto)"},
-            "description": {"type": "STRING", "description": "What the code should do, or what change to make"},
-            "language":    {"type": "STRING", "description": "Programming language (default: python)"},
-            "output_path": {"type": "STRING", "description": "Where to save the file (full path or filename)"},
-            "file_path":   {"type": "STRING", "description": "Path to existing file for edit / explain / run / build"},
-            "code":        {"type": "STRING", "description": "Raw code string for explain"},
-            "args":        {"type": "STRING", "description": "CLI arguments for run/build"},
-            "timeout":     {"type": "INTEGER", "description": "Execution timeout in seconds (default: 30)"},
-        },
-        "required": ["action"]
-    }
-    },
-    {
-    "name": "dev_agent",
-    "description": (
-        "Builds complete multi-file projects from scratch. "
-        "Plans structure, writes all files, installs dependencies, "
-        "opens VSCode, runs the project, and fixes errors automatically. "
-        "Use for any project larger than a single script."
-    ),
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "description":  {"type": "STRING", "description": "What the project should do"},
-            "language":     {"type": "STRING", "description": "Programming language (default: python)"},
-            "project_name": {"type": "STRING", "description": "Optional project folder name"},
-            "timeout":      {"type": "INTEGER", "description": "Run timeout in seconds (default: 30)"},
-        },
-        "required": ["description"]
-    }
-    },
-    {
-    "name": "agent_task",
-    "description": (
-        "Executes complex multi-step tasks that require MULTIPLE DIFFERENT tools. "
-        "Always respond to the user in the language they spoke. "
-        "Examples: 'research X and save to file', 'find files and organize them', "
-        "'fill a form on a website', 'write and test code'. "
-        "DO NOT use for simple computer commands like volume, refresh, close, scroll, "
-        "minimize, screenshot, restart, shutdown — use computer_settings for those. "
-        "DO NOT use if the task can be done with a single tool call."
-    ),
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "goal": {
-                "type": "STRING",
-                "description": "Complete description of what needs to be accomplished"
+        "name": "code_helper",
+        "description": (
+            "Writes, edits, explains, runs, or self-builds code files. "
+            "Use for ANY coding request: writing a script, fixing a file, "
+            "editing existing code, running a file, or building and testing automatically."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":      {"type": "STRING", "description": "write | edit | explain | run | build | auto (default: auto)"},
+                "description": {"type": "STRING", "description": "What the code should do, or what change to make"},
+                "language":    {"type": "STRING", "description": "Programming language (default: python)"},
+                "output_path": {"type": "STRING", "description": "Where to save the file (full path or filename)"},
+                "file_path":   {"type": "STRING", "description": "Path to existing file for edit / explain / run / build"},
+                "code":        {"type": "STRING", "description": "Raw code string for explain"},
+                "args":        {"type": "STRING", "description": "CLI arguments for run/build"},
+                "timeout":     {"type": "INTEGER", "description": "Execution timeout in seconds (default: 30)"},
             },
-            "priority": {
-                "type": "STRING",
-                "description": "low | normal | high (default: normal)"
-            }
-        },
-        "required": ["goal"]
-    }
-},
+            "required": ["action"]
+        }
+    },
     {
-    "name": "computer_control",
-    "description": (
-        "Direct computer control: type text, click buttons, use keyboard shortcuts, "
-        "scroll, move mouse, take screenshots, fill forms, find elements on screen. "
-        "Use when the user wants to interact with any app on the computer directly. "
-        "Can generate random data for forms or use user's real info from memory."
-    ),
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "action":      {"type": "STRING", "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"},
-            "text":        {"type": "STRING", "description": "Text to type or paste"},
-            "x":           {"type": "INTEGER", "description": "X coordinate for click/move"},
-            "y":           {"type": "INTEGER", "description": "Y coordinate for click/move"},
-            "keys":        {"type": "STRING", "description": "Key combination e.g. 'ctrl+c'"},
-            "key":         {"type": "STRING", "description": "Single key to press e.g. 'enter'"},
-            "direction":   {"type": "STRING", "description": "Scroll direction: up | down | left | right"},
-            "amount":      {"type": "INTEGER", "description": "Scroll amount (default: 3)"},
-            "seconds":     {"type": "NUMBER", "description": "Seconds to wait"},
-            "title":       {"type": "STRING", "description": "Window title for focus_window"},
-            "description": {"type": "STRING", "description": "Element description for screen_find/screen_click"},
-            "type":        {"type": "STRING", "description": "Data type for random_data: name|email|username|password|phone|birthday|address"},
-            "field":       {"type": "STRING", "description": "Field for user_data: name|email|city"},
-            "clear_first": {"type": "BOOLEAN", "description": "Clear field before typing (default: true)"},
-            "path":        {"type": "STRING", "description": "Save path for screenshot"},
-        },
-        "required": ["action"]
+        "name": "dev_agent",
+        "description": (
+            "Builds complete multi-file projects from scratch. "
+            "Plans structure, writes all files, installs dependencies, "
+            "opens VSCode, runs the project, and fixes errors automatically. "
+            "Use for any project larger than a single script."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "description":  {"type": "STRING", "description": "What the project should do"},
+                "language":     {"type": "STRING", "description": "Programming language (default: python)"},
+                "project_name": {"type": "STRING", "description": "Optional project folder name"},
+                "timeout":      {"type": "INTEGER", "description": "Run timeout in seconds (default: 30)"},
+            },
+            "required": ["description"]
+        }
+    },
+    {
+        "name": "agent_task",
+        "description": (
+            "Executes complex multi-step tasks that require MULTIPLE DIFFERENT tools. "
+            "Always respond to the user in the language they spoke. "
+            "Examples: 'research X and save to file', 'find files and organize them', "
+            "'fill a form on a website', 'write and test code'. "
+            "DO NOT use for simple computer commands like volume, refresh, close, scroll, "
+            "minimize, screenshot, restart, shutdown — use computer_settings for those. "
+            "DO NOT use if the task can be done with a single tool call."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "goal": {
+                    "type": "STRING",
+                    "description": "Complete description of what needs to be accomplished"
+                },
+                "priority": {
+                    "type": "STRING",
+                    "description": "low | normal | high (default: normal)"
+                }
+            },
+            "required": ["goal"]
+        }
+    },
+    {
+        "name": "computer_control",
+        "description": (
+            "Direct computer control: type text, click buttons, use keyboard shortcuts, "
+            "scroll, move mouse, take screenshots, fill forms, find elements on screen. "
+            "Use when the user wants to interact with any app on the computer directly. "
+            "Can generate random data for forms or use user's real info from memory."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":      {"type": "STRING", "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"},
+                "text":        {"type": "STRING", "description": "Text to type or paste"},
+                "x":           {"type": "INTEGER", "description": "X coordinate for click/move"},
+                "y":           {"type": "INTEGER", "description": "Y coordinate for click/move"},
+                "keys":        {"type": "STRING", "description": "Key combination e.g. 'ctrl+c'"},
+                "key":         {"type": "STRING", "description": "Single key to press e.g. 'enter'"},
+                "direction":   {"type": "STRING", "description": "Scroll direction: up | down | left | right"},
+                "amount":      {"type": "INTEGER", "description": "Scroll amount (default: 3)"},
+                "seconds":     {"type": "NUMBER", "description": "Seconds to wait"},
+                "title":       {"type": "STRING", "description": "Window title for focus_window"},
+                "description": {"type": "STRING", "description": "Element description for screen_find/screen_click"},
+                "type":        {"type": "STRING", "description": "Data type for random_data: name|email|username|password|phone|birthday|address"},
+                "field":       {"type": "STRING", "description": "Field for user_data: name|email|city"},
+                "clear_first": {"type": "BOOLEAN", "description": "Clear field before typing (default: true)"},
+                "path":        {"type": "STRING", "description": "Save path for screenshot"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "flight_finder",
+        "description": (
+            "Searches for flights on Google Flights and speaks the best options. "
+            "Use when user asks about flights, plane tickets, uçuş, bilet, etc."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "origin":       {"type": "STRING",  "description": "Departure city or airport code"},
+                "destination":  {"type": "STRING",  "description": "Arrival city or airport code"},
+                "date":         {"type": "STRING",  "description": "Departure date (any format)"},
+                "return_date":  {"type": "STRING",  "description": "Return date for round trips"},
+                "passengers":   {"type": "INTEGER", "description": "Number of passengers (default: 1)"},
+                "cabin":        {"type": "STRING",  "description": "economy | premium | business | first"},
+                "save":         {"type": "BOOLEAN", "description": "Save results to Notepad"},
+            },
+            "required": ["origin", "destination", "date"]
+        }
     }
-},
-
-{
-    "name": "flight_finder",
-    "description": (
-        "Searches for flights on Google Flights and speaks the best options. "
-        "Use when user asks about flights, plane tickets, uçuş, bilet, etc."
-    ),
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "origin":       {"type": "STRING",  "description": "Departure city or airport code"},
-            "destination":  {"type": "STRING",  "description": "Arrival city or airport code"},
-            "date":         {"type": "STRING",  "description": "Departure date (any format)"},
-            "return_date":  {"type": "STRING",  "description": "Return date for round trips"},
-            "passengers":   {"type": "INTEGER", "description": "Number of passengers (default: 1)"},
-            "cabin":        {"type": "STRING",  "description": "economy | premium | business | first"},
-            "save":         {"type": "BOOLEAN", "description": "Save results to Notepad"},
-        },
-        "required": ["origin", "destination", "date"]
-    }
-}
 ]
+
 
 class JarvisLive:
 
@@ -555,10 +777,24 @@ class JarvisLive:
                 result = r or f"Weather report for {args.get('city')} delivered."
 
             elif name == "browser_control":
-                r = await loop.run_in_executor(
-                    None, lambda: browser_control(parameters=args, player=self.ui)
-                )
-                result = r or "Browser action completed."
+                _bc_action = args.get("action", "")
+                if _bc_action == "play_video":
+                    # Auto-chain: go_to then play_first_video
+                    _goto_args = {"action": "go_to", "url": args.get("url", "")}
+                    _play_args = {"action": "play_first_video"}
+                    r = await loop.run_in_executor(
+                        None, lambda a=_goto_args: browser_control(parameters=a, player=self.ui)
+                    )
+                    await asyncio.sleep(2)
+                    r2 = await loop.run_in_executor(
+                        None, lambda a=_play_args: browser_control(parameters=a, player=self.ui)
+                    )
+                    result = f"{r} | {r2}"
+                else:
+                    r = await loop.run_in_executor(
+                        None, lambda a=args: browser_control(parameters=a, player=self.ui)
+                    )
+                    result = r or "Browser action completed."
 
             elif name == "file_controller":
                 r = await loop.run_in_executor(
@@ -618,6 +854,7 @@ class JarvisLive:
                     None, lambda: desktop_control(parameters=args, player=self.ui)
                 )
                 result = r or "Desktop action completed."
+
             elif name == "code_helper":
                 r = await loop.run_in_executor(
                     None, lambda: code_helper(
@@ -637,6 +874,7 @@ class JarvisLive:
                     )
                 )
                 result = r or "Done."
+
             elif name == "agent_task":
                 goal         = args.get("goal", "")
                 priority_str = args.get("priority", "normal").lower()
@@ -660,8 +898,9 @@ class JarvisLive:
             elif name == "web_search":
                 r = await loop.run_in_executor(
                     None, lambda: web_search_action(parameters=args, player=self.ui)
-                    )
+                )
                 result = r or "Search completed."
+
             elif name == "computer_control":
                 r = await loop.run_in_executor(
                     None, lambda: computer_control(parameters=args, player=self.ui)
@@ -717,7 +956,7 @@ class JarvisLive:
             stream.close()
 
     async def _receive_audio(self):
-        print("[JARVIS] 👂 Recv started")
+        print("[JARVIS] 🔊 Recv started")
         out_buf = []
         in_buf  = []
 
@@ -727,7 +966,27 @@ class JarvisLive:
                 async for response in turn:
 
                     if response.data:
-                        self.audio_in_queue.put_nowait(response.data)
+                        chunk = response.data
+                        raw_chunk = None
+
+                        if isinstance(chunk, (bytes, bytearray)):
+                            raw_chunk = bytes(chunk)
+                        elif isinstance(chunk, str):
+                            try:
+                                raw_chunk = base64.b64decode(chunk, validate=True)
+                                print("[JARVIS][AUDIO][RECV] decoded base64 -> pcm bytes")
+                            except (binascii.Error, ValueError) as e:
+                                print(f"[JARVIS][AUDIO][RECV] invalid base64 audio chunk: {e}")
+                        else:
+                            print(f"[JARVIS][AUDIO][RECV] unsupported chunk type: {type(chunk).__name__}")
+
+                        if raw_chunk:
+                            print(
+                                f"[JARVIS][AUDIO][RECV] type={type(raw_chunk).__name__} "
+                                f"bytes={len(raw_chunk)} queue_before={self.audio_in_queue.qsize()}"
+                            )
+                            self.audio_in_queue.put_nowait(raw_chunk)
+                            print(f"[JARVIS][AUDIO][RECV] queued queue_after={self.audio_in_queue.qsize()}")
 
                     if response.server_content:
                         sc = response.server_content
@@ -781,23 +1040,116 @@ class JarvisLive:
             raise
 
     async def _play_audio(self):
-        print("[JARVIS] 🔊 Play started")
-        stream = await asyncio.to_thread(
-            pya.open,
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RECEIVE_SAMPLE_RATE,
-            output=True,
-        )
+        print("[JARVIS] Play started")
+        output_device_index = 21
+        input_rate = 24000
+        print("[JARVIS] Forced speaker index: 21 (Headphones - JBL Tune 520BT Stereo)")
+
+        stream = None
+        active_rate = None
+        rates_to_try = (24000, 48000, 44100)
+
+        def _resample_pcm16_mono(data: bytes, src_rate: int, dst_rate: int) -> bytes:
+            if src_rate == dst_rate or not data:
+                return data
+            from array import array
+
+            samples = array("h")
+            samples.frombytes(data)
+            in_len = len(samples)
+            if in_len == 0:
+                return b""
+
+            out_len = max(1, int(round(in_len * dst_rate / src_rate)))
+            out = array("h", [0] * out_len)
+            step = src_rate / dst_rate
+
+            for i in range(out_len):
+                src_pos = i * step
+                left = int(src_pos)
+                frac = src_pos - left
+                if left >= in_len - 1:
+                    out[i] = samples[in_len - 1]
+                else:
+                    s0 = samples[left]
+                    s1 = samples[left + 1]
+                    out[i] = int(s0 + (s1 - s0) * frac)
+
+            result = out.tobytes()
+            arr = __import__('numpy').frombuffer(result, dtype=__import__('numpy').int16)
+            arr = __import__('numpy').clip(arr * 8, -32768, 32767).astype(__import__('numpy').int16)
+            return arr.tobytes()
+
         try:
             while True:
+                if stream is None:
+                    for candidate_rate in rates_to_try:
+                        try:
+                            stream = await asyncio.to_thread(
+                                pya.open,
+                                format=pyaudio.paInt16,
+                                channels=1,
+                                rate=candidate_rate,
+                                output=True,
+                                output_device_index=None,
+                                frames_per_buffer=1024,
+                            )
+                            active_rate = candidate_rate
+                            print(f"[JARVIS][AUDIO][PLAY] opened output stream rate={active_rate}")
+                            break
+                        except Exception as open_err:
+                            print(f"[JARVIS][AUDIO][PLAY] open failed rate={candidate_rate}: {open_err}")
+
+                    if stream is None:
+                        print("[JARVIS][AUDIO][PLAY] cannot open forced device 21 yet, retrying in 3s")
+                        await asyncio.sleep(3)
+                        continue
+
                 chunk = await self.audio_in_queue.get()
-                await asyncio.to_thread(stream.write, chunk)
+                print(f"AUDIO CHUNK SIZE: {len(chunk) if chunk else 0}")
+
+                if not chunk:
+                    continue
+
+                if not isinstance(chunk, (bytes, bytearray)):
+                    print(f"[JARVIS][AUDIO][PLAY] skip non-bytes chunk type={type(chunk).__name__}")
+                    continue
+
+                if len(chunk) > 500000:
+                    print(f"[JARVIS][AUDIO][PLAY] skip oversized chunk: {len(chunk)}")
+                    continue
+
+                out_chunk = bytes(chunk)
+                if active_rate != input_rate:
+                    out_chunk = _resample_pcm16_mono(out_chunk, input_rate, active_rate)
+                    if not out_chunk:
+                        continue
+                    print(
+                        f"[JARVIS][AUDIO][PLAY] resampled {input_rate}->{active_rate}, "
+                        f"bytes={len(out_chunk)}"
+                    )
+
+                try:
+                    await asyncio.to_thread(stream.write, out_chunk)
+                    print("[JARVIS][AUDIO][PLAY] stream.write ok")
+                except Exception as write_err:
+                    print(f"[JARVIS][AUDIO][PLAY] stream.write failed: {write_err}")
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    except Exception:
+                        pass
+                    stream = None
+                    active_rate = None
+
         except Exception as e:
-            print(f"[JARVIS] ❌ Play error: {e}")
-            raise
+            print(f"[JARVIS] Play error: {e}")
+            traceback.print_exc()
+
         finally:
-            stream.close()
+            if stream is not None:
+                stream.stop_stream()
+                stream.close()
 
     async def run(self):
         client = genai.Client(
@@ -807,7 +1159,7 @@ class JarvisLive:
 
         while True:
             try:
-                print("[JARVIS] 🔌 Connecting...")
+                print("[JARVIS] 🔑 Connecting...")
                 config = self._build_config()
 
                 async with (
